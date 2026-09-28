@@ -1,13 +1,13 @@
 # multi-stage Dockerfile for quick, minimal production image
 
 # 1. build the React frontend
-FROM node:22-slim AS frontend-builder
+FROM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS frontend-builder
 WORKDIR /app/frontend
 
-# copy only package.json (NOT lockfile) — npm ci + lockfile is broken
-# for multi-platform builds due to npm bug #4828 with optional deps
-COPY frontend/package.json ./
-RUN npm install
+# Confenge is built for one target (linux/amd64), so the committed lockfile is
+# authoritative and npm can perform a reproducible clean install.
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
 
 # copy the rest of the frontend code and build
 COPY frontend/ .
@@ -15,7 +15,7 @@ RUN npm run build
 
 
 # 2. production Python image
-FROM python:3.12-slim AS backend
+FROM python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f AS backend
 WORKDIR /app
 
 # pg_dump / pg_restore for backup & restore (see app/backup_pg.py)
@@ -24,8 +24,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # install runtime dependencies
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # copy backend source code
 COPY app/ ./app/
