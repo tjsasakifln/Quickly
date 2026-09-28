@@ -78,6 +78,25 @@ async def test_first_admin_registration_has_explicit_rate_limit(engine):
 
 
 @pytest.mark.asyncio
+async def test_first_admin_registration_and_login_accept_dotted_username(engine):
+    payload = {
+        "username": "Tiago.Sasaki",
+        "email": "tiago.sasaki@example.com",
+        "password": "StrongPass123",
+    }
+    async with httpx.AsyncClient(transport=_transport(), base_url="http://test") as client:
+        registered = await client.post("/api/auth/register", json=payload)
+        assert registered.status_code == 201
+        assert registered.json()["username"] == "tiago.sasaki"
+
+        logged_in = await client.post(
+            "/api/auth/login",
+            json={"username": "tiago.sasaki", "password": payload["password"]},
+        )
+        assert logged_in.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_concurrent_first_admin_registration_creates_exactly_one_admin(engine):
     payloads = (
         {
