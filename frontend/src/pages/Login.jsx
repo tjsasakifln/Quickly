@@ -18,7 +18,11 @@ function parseDetailMessage(text) {
 }
 
 export default function Login() {
-  const { setupComplete } = useAuth();
+  const { setupComplete, login } = useAuth();
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginError, setLoginError] = useState(null);
   const [restoreExpanded, setRestoreExpanded] = useState(false);
   const [restoreFile, setRestoreFile] = useState(null);
   const [restoreFileKey, setRestoreFileKey] = useState(0);
@@ -108,6 +112,65 @@ export default function Login() {
         </div>
 
         <div className="mt-8 space-y-4">
+          {!isFirstUser && (
+            <form
+              className="space-y-3"
+              onSubmit={async event => {
+                event.preventDefault();
+                setLoginBusy(true);
+                setLoginError(null);
+                try {
+                  await login(username, password);
+                } catch (error) {
+                  setLoginError(error.message || 'Unable to sign in');
+                } finally {
+                  setLoginBusy(false);
+                }
+              }}
+            >
+              <label className="block text-sm font-medium text-gray-700" htmlFor="username">
+                Username
+              </label>
+              <input
+                id="username"
+                name="username"
+                type="text"
+                autoComplete="username"
+                required
+                value={username}
+                onChange={event => setUsername(event.target.value)}
+                disabled={loginBusy}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm disabled:opacity-50"
+              />
+              <label className="block text-sm font-medium text-gray-700" htmlFor="password">
+                Password
+              </label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={event => setPassword(event.target.value)}
+                disabled={loginBusy}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm disabled:opacity-50"
+              />
+              {loginError && (
+                <p role="alert" className="text-sm text-red-600">{loginError}</p>
+              )}
+              <button
+                type="submit"
+                disabled={loginBusy}
+                className="w-full py-2.5 px-4 rounded-lg text-sm font-medium text-white bg-gray-900 hover:bg-gray-800 disabled:opacity-50"
+              >
+                {loginBusy ? 'Signing in…' : 'Sign in'}
+              </button>
+              <div className="relative py-1 text-center text-xs text-gray-500 before:absolute before:inset-x-0 before:top-1/2 before:border-t before:border-gray-200">
+                <span className="relative bg-gray-50 px-2">or continue with</span>
+              </div>
+            </form>
+          )}
           <a
             href="/oauth/app/google/authorize"
             className="w-full flex items-center justify-center gap-3 py-2.5 px-4 border border-gray-300 rounded-lg shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"

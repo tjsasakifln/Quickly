@@ -74,6 +74,41 @@ export function AuthProvider({ children }) {
     }
   }, [refreshToken]);
 
+  const login = useCallback(async (username, password) => {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ username, password }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || 'Unable to sign in');
+    }
+    if (!data.access_token) {
+      throw new Error('The server did not return an access token');
+    }
+
+    // Keep this short-lived token in memory only. The refresh cookie is httpOnly.
+    _accessToken = data.access_token;
+    try {
+      const userRes = await fetch('/api/auth/me', {
+        headers: { Authorization: `Bearer ${_accessToken}` },
+      });
+      if (!userRes.ok) {
+        throw new Error('Unable to load your account');
+      }
+      const currentUser = await userRes.json();
+      setUser(currentUser);
+      return currentUser;
+    } catch (error) {
+      _accessToken = null;
+      setUser(null);
+      throw error;
+    }
+  }, []);
+
   const logout = useCallback(async () => {
     await fetch('/api/auth/logout', {
       method: 'POST',
@@ -117,6 +152,7 @@ export function AuthProvider({ children }) {
       user,
       loading,
       setupComplete,
+      login,
       logout,
       refreshToken,
       checkSetup,
