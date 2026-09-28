@@ -8,9 +8,10 @@ set -a; . ./.env; set +a
 : "${QUICKLY_BOOTSTRAP_ADMIN_USERNAME:?missing bootstrap username}"
 : "${QUICKLY_BOOTSTRAP_ADMIN_EMAIL:?missing bootstrap email}"
 : "${QUICKLY_BOOTSTRAP_ADMIN_PASSWORD:?missing bootstrap password}"
-# The API expects JSON. Limit these bootstrap values to the URL-safe alphabet so
-# shell/JSON quoting cannot accidentally change a credential in transit.
-[[ "$QUICKLY_BOOTSTRAP_ADMIN_USERNAME" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'Bootstrap username must be alphanumeric, _ or -.' >&2; exit 1; }
+# The API expects JSON. Limit these bootstrap values to a conservative URL-safe
+# alphabet so shell/JSON quoting cannot accidentally change a credential in
+# transit. Dots are allowed because production usernames use email-style names.
+[[ "$QUICKLY_BOOTSTRAP_ADMIN_USERNAME" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo 'Bootstrap username must use letters, digits, ., _ or -.' >&2; exit 1; }
 [[ "$QUICKLY_BOOTSTRAP_ADMIN_PASSWORD" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'Use a URL-safe bootstrap password (letters, digits, _ and -).' >&2; exit 1; }
 
 endpoint=http://127.0.0.1:19080/api/auth/setup-status
