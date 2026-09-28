@@ -178,6 +178,15 @@ function buildChecks(d) {
   smtpAccounts.forEach(acc => {
     const inboxLink = `/inboxes?inbox=${acc.inbox_id}`;
     const label = acc.inbox_display_name || acc.inbox_email;
+    if (acc.imap_configured && acc.imap_followups_on_hold) {
+      smtpStatus = 'error';
+      smtpIssues.push({
+        level: 'error',
+        text: `Follow-ups are on hold for ${label}: ${acc.imap_followup_hold_reason || 'IMAP reply sync is unavailable'}`,
+        fix: 'Open the inbox and diagnose the IMAP connection. Follow-ups resume automatically after a successful sync.',
+        action: { label: 'Fix it', to: inboxLink },
+      });
+    }
     if (acc.health === 'failing' || acc.last_send_error) {
       smtpStatus = 'error';
       smtpIssues.push({
@@ -215,7 +224,7 @@ function buildChecks(d) {
       status: smtpStatus,
       issues: smtpIssues,
       meta: { accounts: smtpAccounts },
-      detail: `${smtpAccounts.length} SMTP inbox${smtpAccounts.length !== 1 ? 'es' : ''} — ${smtpAccounts.filter(a => (a.health || 'ok') === 'ok' && !a.last_send_error).length} healthy`,
+      detail: `${smtpAccounts.length} SMTP inbox${smtpAccounts.length !== 1 ? 'es' : ''} — ${smtpAccounts.filter(a => (a.health || 'ok') === 'ok' && !a.last_send_error && !a.imap_followups_on_hold).length} healthy`,
     });
   }
 

@@ -21,6 +21,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Index,
+    text,
 )
 from sqlalchemy.orm import relationship
 from app.time import utcnow as _utcnow
@@ -99,6 +100,10 @@ class Inbox(Base):
     max_emails_per_day = Column(Integer, default=50, nullable=False)
     wait_minutes_between = Column(Integer, default=5, nullable=False)  # Minutes between emails from this inbox
     max_jitter_seconds = Column(Integer, default=180, nullable=False)   # Max random seconds added to each send time (0 = disabled)
+    # Optional precise cadence.  When both are set, each send gap is sampled
+    # inclusively from this range; NULL keeps the legacy minute+jitter policy.
+    min_wait_seconds = Column(Integer, nullable=True, default=None)
+    max_wait_seconds = Column(Integer, nullable=True, default=None)
     provider = Column(String(32), default="gmail")  # gmail | office365 | smtp
     # Custom tracking domain for this inbox (hostname only, e.g. "mail.client.com").
     # When set, open/click tracking URLs for emails sent from this inbox will use
@@ -355,6 +360,17 @@ class EmailLog(Base):
         Index("ix_email_log_lead_campaign", "lead_id", "campaign_id"),
         # Single: campaign-level aggregate queries (list_campaigns analytics)
         Index("ix_email_log_campaign", "campaign_id"),
+        # Only one delivery attempt may be in an indeterminate state for a
+        # campaign step.  Historical/successful rows remain compatible.
+        Index(
+            "uq_email_log_active_delivery_attempt",
+            "lead_id",
+            "campaign_id",
+            "sequence_index",
+            unique=True,
+            postgresql_where=text("delivery_state IN ('sending', 'uncertain')"),
+            sqlite_where=text("delivery_state IN ('sending', 'uncertain')"),
+        ),
     )
     id = Column(Integer, primary_key=True, index=True)
     lead_id = Column(Integer, ForeignKey("lead.id"), nullable=False)
@@ -371,6 +387,11 @@ class EmailLog(Base):
     )
     open_token = Column(String(32), unique=True, nullable=True, index=True, default=_make_open_token)
     format_override = Column(String(64), nullable=True, default=None)  # why format was overridden
+    # ``sending`` is committed before the network call.  If the process dies
+    # before it can record the result, the next worker converts it to
+    # ``uncertain`` and blocks an automatic resend.
+    delivery_state = Column(String(16), nullable=False, default="sent")
+    delivery_error = Column(Text, nullable=False, default="")
     sent_at = Column(DateTime, default=_utcnow)
     subject = Column(String(512), default="")
     message_id = Column(String(512), default=None)  # RFC 822 Message-ID for In-Reply-To threading
@@ -776,7 +797,13 @@ class SmtpSyncState(Base):
     inbox_id = Column(Integer, ForeignKey("inbox.id"), nullable=False, unique=True)
     uidvalidity = Column(BigInteger, nullable=True)
     last_uid = Column(Integer, nullable=False, default=0)
+    # ``last_sync_at`` is retained for backwards compatibility and mirrors a
+    # successful sync.  The explicit attempt/success/error fields let the send
+    # path distinguish a healthy idle mailbox from a broken or stale poller.
     last_sync_at = Column(DateTime, nullable=True)
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_success_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=False, default="")
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
     inbox = relationship("Inbox", back_populates="smtp_sync_state")

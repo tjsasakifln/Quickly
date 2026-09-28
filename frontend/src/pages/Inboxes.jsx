@@ -644,6 +644,12 @@ function InboxTrackingOptions({
   );
 }
 
+function preciseCadenceError({ min_wait_seconds: min, max_wait_seconds: max }) {
+  if ((min == null) !== (max == null)) return 'Set both precise cadence values, or clear both.';
+  if (min != null && (min < 1 || max > 3600 || min > max)) return 'Precise cadence must be between 1 and 3600 seconds, with min no greater than max.';
+  return null;
+}
+
 export default function Inboxes() {
   const [inboxes, setInboxes] = useState(() => apiCache.get('/inboxes') || []);
   const [cnameTarget, setCnameTarget] = useState('');
@@ -656,6 +662,8 @@ export default function Inboxes() {
     max_emails_per_day: 50,
     wait_minutes_between: 5,
     max_jitter_seconds: 180,
+    min_wait_seconds: null,
+    max_wait_seconds: null,
     tracking_domain: '',
     ramp_up_enabled: false,
     ramp_up_period_days: 42,
@@ -947,6 +955,11 @@ export default function Inboxes() {
   const submit = async (e) => {
     e.preventDefault();
     setMessage(null);
+    const cadenceError = preciseCadenceError(form);
+    if (cadenceError) {
+      setMessage({ type: 'error', text: cadenceError });
+      return;
+    }
     if (form.provider === 'gmail') {
       if (!oauthConfigured) {
         setMessage({
@@ -1108,6 +1121,11 @@ export default function Inboxes() {
 
   const doSave = async () => {
     if (!editing) return;
+    const cadenceError = preciseCadenceError(editing);
+    if (cadenceError) {
+      setEditMsg({ type: 'error', text: cadenceError });
+      return;
+    }
     const newDomain = editTrackingMode === 'dns' ? (editing.tracking_domain || '').trim() : '';
     const domainChanged = newDomain !== editOriginalDomain.current;
     if (editTrackingMode === 'dns' && newDomain && domainChanged && !editDomainVerified) {
@@ -1134,6 +1152,8 @@ export default function Inboxes() {
         max_emails_per_day: editing.max_emails_per_day,
         wait_minutes_between: editing.wait_minutes_between,
         max_jitter_seconds: clampJitterSeconds(editing.max_jitter_seconds ?? 180),
+        min_wait_seconds: editing.min_wait_seconds ?? null,
+        max_wait_seconds: editing.max_wait_seconds ?? null,
         tracking_domain: newDomain || null,
         ramp_up_enabled: editing.ramp_up_enabled,
         ramp_up_period_days: editing.ramp_up_period_days,
@@ -1518,6 +1538,8 @@ export default function Inboxes() {
         max_per_day: form.max_emails_per_day,
         wait_minutes_between: form.wait_minutes_between,
         max_jitter_seconds: form.max_jitter_seconds,
+        min_wait_seconds: form.min_wait_seconds ?? null,
+        max_wait_seconds: form.max_wait_seconds ?? null,
         tracking_domain: form.tracking_domain || '',
         ramp_up_enabled: form.ramp_up_enabled,
         ramp_up_start: form.ramp_up_start,
@@ -1835,6 +1857,17 @@ export default function Inboxes() {
                         />
                         <p className="mt-1 text-xs text-gray-400">Random 0–N minute delay per send (stored as seconds on the server). Set to 0 to disable.</p>
                       </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700">Precise min gap (seconds)</label>
+                          <input type="number" value={editing.min_wait_seconds ?? ''} onChange={e => { setEditing(prev => ({ ...prev, min_wait_seconds: e.target.value === '' ? null : +e.target.value })); setEditDirty(true); }} min={1} max={3600} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700">Precise max gap (seconds)</label>
+                          <input type="number" value={editing.max_wait_seconds ?? ''} onChange={e => { setEditing(prev => ({ ...prev, max_wait_seconds: e.target.value === '' ? null : +e.target.value })); setEditDirty(true); }} min={1} max={3600} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                        </div>
+                        <p className="col-span-2 text-xs text-gray-400">Set both values (for example 20 and 60) for a random seconds-level gap. Leave both blank to retain minute wait and jitter.</p>
+                      </div>
                       <div className="border rounded p-3 space-y-4 bg-gray-50 min-w-0 max-w-full overflow-hidden">
                         <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">
                           Tracking
@@ -2029,7 +2062,11 @@ export default function Inboxes() {
                       </div>
                       <div className="flex justify-between text-sm">
                         <span className="text-gray-600">Wait between sends</span>
-                        <span className="font-medium text-gray-900">{selectedInbox.wait_minutes_between || 5} min</span>
+                        <span className="font-medium text-gray-900">
+                          {selectedInbox.min_wait_seconds != null && selectedInbox.max_wait_seconds != null
+                            ? `${selectedInbox.min_wait_seconds}–${selectedInbox.max_wait_seconds} sec`
+                            : `${selectedInbox.wait_minutes_between || 5} min`}
+                        </span>
                       </div>
                       <div className="flex justify-between text-sm">
                         <span className="text-gray-600">Send jitter</span>
@@ -2186,6 +2223,17 @@ export default function Inboxes() {
                   className="mt-1 block w-full border-gray-300 rounded-md"
                 />
                 <p className="mt-1 text-xs text-gray-400">Random 0–N minute delay per send (default 3 min). Set to 0 to disable.</p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Precise min gap (seconds)</label>
+                  <input type="number" value={form.min_wait_seconds ?? ''} onChange={e => setForm(f => ({ ...f, min_wait_seconds: e.target.value === '' ? null : +e.target.value }))} min={1} max={3600} className="mt-1 block w-full border-gray-300 rounded-md" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Precise max gap (seconds)</label>
+                  <input type="number" value={form.max_wait_seconds ?? ''} onChange={e => setForm(f => ({ ...f, max_wait_seconds: e.target.value === '' ? null : +e.target.value }))} min={1} max={3600} className="mt-1 block w-full border-gray-300 rounded-md" />
+                </div>
+                <p className="col-span-2 text-xs text-gray-400">Set both values (for example 20 and 60) for a random seconds-level gap. Leave both blank to retain the legacy minute wait and jitter.</p>
               </div>
               {form.provider === 'smtp' && (
                 <div className="border rounded p-3 space-y-3 bg-gray-50 min-w-0 max-w-full overflow-hidden">

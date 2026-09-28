@@ -45,7 +45,11 @@ async def daily_analytics(
             EmailLog.campaign_id,
             func.count().label("sent"),
         )
-        .where(EmailLog.sent_at >= start, EmailLog.sent_at < end)
+        .where(
+            EmailLog.sent_at >= start,
+            EmailLog.sent_at < end,
+            EmailLog.delivery_state == "sent",
+        )
         .group_by(cast(EmailLog.sent_at, Date), EmailLog.campaign_id)
     )
     if campaign_id:

@@ -1557,32 +1557,44 @@ def _fetch_smtp_new_messages(
         uid_bytes = uid_data[0] if uid_data else b""
         uids = [int(u) for u in uid_bytes.split() if u.isdigit()]
         # Only process genuinely-new UIDs (RFC 3501 `last+1:*` can re-return
-        # the highest existing message) and, when over the cap, keep the
-        # NEWEST ones so a busy INBOX cannot starve fresh reply detection.
+        # the highest existing message).  Process the oldest page first: the
+        # caller advances a high-water mark, so taking the newest page would
+        # permanently skip every deferred UID.
         uids = sorted(u for u in uids if u > int(last_uid))
         cap = max(1, cap)
         if len(uids) > cap:
             deferred = len(uids) - cap
             log.warning(
-                "SMTP sync: %d new UIDs beyond fetch cap %d — deferring the oldest %d "
+                "SMTP sync: %d new UIDs beyond fetch cap %d — deferring the newest %d "
                 "(next sync continues); watch for chronic backlog",
                 deferred, cap, deferred,
             )
-            uids = uids[-cap:]
+            uids = uids[:cap]
 
         out: list[tuple[int, bytes]] = []
         for uid in uids:
             try:
-                typ, fetched = client.uid("fetch", str(uid), "(RFC822)")
-            except Exception:
-                log.warning("SMTP sync: fetch failed for UID %s", uid)
-                continue
+                # BODY.PEEK[] retrieves the full message without setting the
+                # server-side \Seen flag (RFC 3501 section 6.4.5).
+                typ, fetched = client.uid("fetch", str(uid), "(BODY.PEEK[])")
+            except Exception as exc:
+                log.warning("SMTP sync: fetch failed for UID %s: %s", uid, exc)
+                # Abort the page instead of reporting a partial poll as
+                # healthy.  The checkpoint is unchanged, so the full page is
+                # safely retried (DB upserts make reprocessing idempotent).
+                raise
             if typ != "OK" or not fetched:
-                continue
+                # Never advance beyond a UID that was not fetched.  A later
+                # poll retries it and all newer UIDs.
+                raise RuntimeError(f"IMAP fetch failed for UID {uid}")
+            appended = False
             for part in fetched:
                 if isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray)):
                     out.append((uid, bytes(part[1])))
+                    appended = True
                     break
+            if not appended:
+                raise RuntimeError(f"IMAP fetch returned no message body for UID {uid}")
         return current_validity, out
     finally:
         try:
@@ -1863,12 +1875,18 @@ async def _sync_inbox_smtp(db: AsyncSession, inbox, reason: str = "") -> set[tup
         db.add(state)
         await db.flush()
 
+    attempted_at = time_provider.utcnow()
+    state.last_attempt_at = attempted_at
     try:
         new_validity, fetched = await asyncio.to_thread(
             _fetch_smtp_new_messages, acct, state.uidvalidity, state.last_uid or 0
         )
     except Exception as exc:
         log.warning("SMTP IMAP sync failed for inbox_id=%s: %s", inbox.id, exc)
+        from app.smtp_utils import sanitize_connection_error
+
+        state.last_error = sanitize_connection_error(str(exc)) or "IMAP sync failed"
+        await db.flush()
         # Distinguish a bad credential from a transient network/IMAP error so
         # the notification does not claim "OAuth token expired" for both.
         exc_low = str(exc).lower()
@@ -1898,20 +1916,30 @@ async def _sync_inbox_smtp(db: AsyncSession, inbox, reason: str = "") -> set[tup
         state.last_uid = 0
         await db.flush()
 
+    # The transport completed.  A subsequent parse failure below replaces
+    # this with a message-specific error; otherwise this poll is healthy.
+    state.last_error = ""
+
     if not fetched:
-        state.last_sync_at = time_provider.utcnow()
+        succeeded_at = time_provider.utcnow()
+        state.last_sync_at = succeeded_at
+        state.last_success_at = succeeded_at
+        state.last_error = ""
         await db.flush()
         return touched
 
     own_addr = (inbox.email or "").lower()
     max_uid = state.last_uid or 0
     for uid, raw in fetched:
-        max_uid = max(max_uid, uid)
         try:
             parsed = _parse_imap(raw)
         except Exception:
             log.warning("SMTP sync: failed to parse UID %s for inbox_id=%s", uid, inbox.id)
-            continue
+            # A failed parse is retryable.  Do not advance the checkpoint past
+            # it, otherwise that message (and potentially a reply) is lost.
+            state.last_error = f"IMAP message UID {uid} could not be parsed"
+            break
+        max_uid = max(max_uid, uid)
         # Skip our own sent copies to avoid self-reply loops.
         if (parsed.get("from") or "").lower() == own_addr:
             continue
@@ -1953,7 +1981,11 @@ async def _sync_inbox_smtp(db: AsyncSession, inbox, reason: str = "") -> set[tup
             touched.add(_touched)
 
     state.last_uid = max_uid
-    state.last_sync_at = time_provider.utcnow()
+    if not state.last_error:
+        succeeded_at = time_provider.utcnow()
+        state.last_sync_at = succeeded_at
+        state.last_success_at = succeeded_at
+        state.last_error = ""
     await db.flush()
     log.info("SMTP IMAP sync inbox_id=%s fetched=%s touched=%s", inbox.id, len(fetched), len(touched))
     return touched

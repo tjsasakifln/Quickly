@@ -12,7 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFi
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text as sql_text
 from sqlalchemy.orm import selectinload
 from datetime import date
 from typing import List
@@ -61,6 +61,86 @@ from app.queue_logic import reserve_slots_for_new_leads_bulk
 log = logging.getLogger("quickly.routes")
 
 router = APIRouter(prefix="/api/campaigns", tags=["campaigns"])
+
+_CSV_RESERVED_LOWER = frozenset(
+    {"email", "name", "status", "interest", "email_verification_status"}
+)
+_RUNTIME_TEMPLATE_VARIABLES = frozenset({"name", "email", "unsubscribe_link"})
+
+
+def _standard_sequence_required_variables(sequences: list[Sequence]) -> set[str]:
+    """Variables a CSV row must provide for every possible standard send.
+
+    Enabled A/B variants are included because any of them can be selected at
+    send time.  Personalized sequence fallbacks are deliberately excluded:
+    their lifecycle is handled by the personalized-email workflow.
+    """
+    from app.sender import extract_template_variables
+
+    required: set[str] = set()
+    for sequence in sequences:
+        if (sequence.sequence_type or "standard") != "standard":
+            continue
+        required.update(extract_template_variables(sequence.subject, sequence.body))
+        for variant in getattr(sequence, "variants", []) or []:
+            if not variant.enabled:
+                continue
+            required.update(
+                extract_template_variables(
+                    variant.subject if variant.subject is not None else sequence.subject,
+                    variant.body or sequence.body,
+                )
+            )
+    return required - _RUNTIME_TEMPLATE_VARIABLES
+
+
+def _csv_row_by_header(
+    row: dict,
+    fieldnames: list[str | None],
+) -> dict[str, str]:
+    """Map stripped headers to cell text while preserving cell content."""
+    by_header: dict[str, str] = {}
+    for field_key in fieldnames:
+        header = (field_key or "").strip()
+        if not header:
+            continue
+        raw_value = row.get(field_key)
+        by_header[header] = raw_value if raw_value is not None else ""
+    return by_header
+
+
+def _csv_row_identity_and_custom_data(
+    by_header: dict[str, str],
+    raw_headers: list[str],
+) -> tuple[str, str, dict[str, str]]:
+    email = next(
+        (by_header[header] for header in raw_headers if header.lower() == "email"),
+        "",
+    ).strip().lower()
+    name = next(
+        (by_header[header] for header in raw_headers if header.lower() == "name"),
+        "",
+    ).strip()
+    custom_data = {
+        header: by_header.get(header, "")
+        for header in raw_headers
+        if header and header.lower() not in _CSV_RESERVED_LOWER
+        and by_header.get(header, "") != ""
+    }
+    return email, name, custom_data
+
+
+async def _lock_lead_import(db: AsyncSession) -> None:
+    """Serialize lead imports without rewriting legacy duplicate rows.
+
+    A single transaction lock avoids both check/insert races and deadlocks
+    caused by concurrent files listing the same emails in different orders.
+    """
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        await db.execute(
+            sql_text("SELECT pg_advisory_xact_lock(hashtext('quickly:lead-import'))")
+        )
 
 
 def _apply_campaign_lead_add_options(cl: CampaignLead, lead: Lead, entry: CampaignLeadAdd) -> None:
@@ -154,7 +234,10 @@ async def list_campaigns(db: AsyncSession = Depends(get_db)):
         # email counts
         res = await db.execute(
             select(EmailLog.campaign_id, func.count())
-            .where(EmailLog.campaign_id.in_(campaign_ids))
+            .where(
+                EmailLog.campaign_id.in_(campaign_ids),
+                EmailLog.delivery_state == "sent",
+            )
             .group_by(EmailLog.campaign_id)
         )
         for cid, cnt in res.all():
@@ -174,7 +257,11 @@ async def list_campaigns(db: AsyncSession = Depends(get_db)):
         # open counts
         res = await db.execute(
             select(EmailLog.campaign_id, func.count())
-            .where(EmailLog.campaign_id.in_(campaign_ids), EmailLog.opened == True)
+            .where(
+                EmailLog.campaign_id.in_(campaign_ids),
+                EmailLog.opened == True,
+                EmailLog.delivery_state == "sent",
+            )
             .group_by(EmailLog.campaign_id)
         )
         for cid, cnt in res.all():
@@ -182,7 +269,11 @@ async def list_campaigns(db: AsyncSession = Depends(get_db)):
         # click counts
         res = await db.execute(
             select(EmailLog.campaign_id, func.count())
-            .where(EmailLog.campaign_id.in_(campaign_ids), EmailLog.clicked == True)
+            .where(
+                EmailLog.campaign_id.in_(campaign_ids),
+                EmailLog.clicked == True,
+                EmailLog.delivery_state == "sent",
+            )
             .group_by(EmailLog.campaign_id)
         )
         for cid, cnt in res.all():
@@ -383,7 +474,10 @@ async def get_campaign(campaign_id: int, db: AsyncSession = Depends(get_db)):
     res = await db.execute(
         select(func.count())
         .select_from(EmailLog)
-        .where(EmailLog.campaign_id == campaign_id)
+        .where(
+            EmailLog.campaign_id == campaign_id,
+            EmailLog.delivery_state == "sent",
+        )
     )
     stats["emails_sent"] = res.scalar() or 0
     # scheduled
@@ -1791,7 +1885,10 @@ async def step_analytics(campaign_id: int, db: AsyncSession = Depends(get_db)):
     log_result = await db.execute(
         select(EmailLog)
         .options(selectinload(EmailLog.variant))
-        .where(EmailLog.campaign_id == campaign_id)
+        .where(
+            EmailLog.campaign_id == campaign_id,
+            EmailLog.delivery_state == "sent",
+        )
     )
     logs = log_result.scalars().all()
 
@@ -1922,9 +2019,80 @@ async def list_sent_emails(campaign_id: int, db: AsyncSession = Depends(get_db))
             "variant_id": el.variant_id,
             "variant_label": (el.variant.label if el.variant else None),
             "inbox_email": inbox.email if inbox else None,
+            "delivery_state": getattr(el, "delivery_state", "sent") or "sent",
+            "delivery_error": getattr(el, "delivery_error", "") or "",
         }
         for el, lead, cl, inbox in rows
     ]
+
+
+class DeliveryResolutionRequest(BaseModel):
+    action: str  # mark_sent | retry
+
+
+@router.post("/{campaign_id}/sent/{log_id}/resolve")
+async def resolve_uncertain_delivery(
+    campaign_id: int,
+    log_id: int,
+    data: DeliveryResolutionRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve an indeterminate SMTP attempt by explicit operator choice."""
+    action = (data.action or "").strip().lower()
+    if action not in {"mark_sent", "retry"}:
+        raise HTTPException(422, "action must be 'mark_sent' or 'retry'")
+
+    log_row = await db.execute(
+        select(EmailLog).where(
+            EmailLog.id == log_id,
+            EmailLog.campaign_id == campaign_id,
+        )
+    )
+    email_log = log_row.scalar_one_or_none()
+    if email_log is None:
+        raise HTTPException(404, "Email log not found")
+    if email_log.delivery_state != "uncertain":
+        raise HTTPException(409, "Only uncertain deliveries require resolution")
+
+    cl_row = await db.execute(
+        select(CampaignLead).where(
+            CampaignLead.campaign_id == campaign_id,
+            CampaignLead.lead_id == email_log.lead_id,
+        ).limit(1)
+    )
+    enrollment = cl_row.scalar_one_or_none()
+
+    if action == "mark_sent":
+        email_log.delivery_state = "sent"
+        email_log.delivery_error = "Resolved by operator as accepted/sent"
+    else:
+        email_log.delivery_state = "failed"
+        email_log.delivery_error = "Resolved by operator for an explicit retry"
+
+    if enrollment is not None:
+        enrollment.sending_paused = False
+        await db.execute(
+            delete(QueueSlot).where(QueueSlot.campaign_lead_id == enrollment.id)
+        )
+        if action == "mark_sent":
+            sequence_count = (
+                await db.execute(
+                    select(func.count(Sequence.id)).where(
+                        Sequence.campaign_id == campaign_id
+                    )
+                )
+            ).scalar() or 0
+            if enrollment.enrollment_status == "active":
+                enrollment.enrollment_status = "contacted"
+            if sequence_count > 0 and email_log.sequence_index >= sequence_count - 1:
+                enrollment.enrollment_status = "completed"
+
+    await db.commit()
+    from app.routers.schedule import enqueue_global_recalculate
+
+    enqueue_global_recalculate(background_tasks)
+    return {"ok": True, "delivery_state": email_log.delivery_state, "action": action}
 
 
 @router.delete("/{campaign_id}/leads/{lead_id}")
@@ -1992,6 +2160,7 @@ async def bulk_add_leads_to_campaign(
     # Deduplicate within the batch — keep only the first occurrence of each email
     seen_emails: set[str] = set()
     deduped: list[CampaignLeadAdd] = []
+
     for entry in leads_data:
         norm = entry.email.strip().lower()
         if norm not in seen_emails:
@@ -2033,6 +2202,8 @@ async def bulk_add_leads_to_campaign(
             },
         }
 
+    await _lock_lead_import(db)
+
     results = []
     added = 0
     already_enrolled = 0
@@ -2050,8 +2221,36 @@ async def bulk_add_leads_to_campaign(
 
         try:
             # Find or create lead by email
-            lead_result = await db.execute(select(Lead).where(Lead.email == email))
+            # Reuse legacy mixed-case rows as well as normalized imports.  A
+            # deterministic first match avoids creating another duplicate if
+            # an older database already contains case-only duplicates.
+            lead_result = await db.execute(
+                select(Lead)
+                .where(func.lower(Lead.email) == email)
+                .order_by(Lead.id)
+                .limit(1)
+            )
             lead = lead_result.scalar_one_or_none()
+            if lead is not None:
+                if skip_duplicates:
+                    enrollment_check = await db.execute(
+                        select(CampaignLead.id)
+                        .where(CampaignLead.lead_id == lead.id)
+                        .limit(1)
+                    )
+                else:
+                    enrollment_check = await db.execute(
+                        select(CampaignLead.id).where(
+                            CampaignLead.campaign_id == campaign_id,
+                            CampaignLead.lead_id == lead.id,
+                        ).limit(1)
+                    )
+                if enrollment_check.scalar_one_or_none() is not None:
+                    if skip_duplicates:
+                        duplicate_leads.append(email)
+                    results.append({"email": email, "status": "already_enrolled"})
+                    already_enrolled += 1
+                    continue
             if not lead:
                 lead = Lead(
                     email=email,
@@ -2072,30 +2271,6 @@ async def bulk_add_leads_to_campaign(
                     changed = True
                 if changed:
                     await db.flush()
-
-            # Check enrollment
-            if skip_duplicates:
-                # Global check: skip if enrolled in any campaign
-                existing_any = await db.execute(
-                    select(CampaignLead).where(CampaignLead.lead_id == lead.id)
-                )
-                if existing_any.scalar_one_or_none():
-                    duplicate_leads.append(email)
-                    results.append({"email": email, "status": "already_enrolled"})
-                    already_enrolled += 1
-                    continue
-            else:
-                # Only check this campaign to avoid a DB constraint violation
-                existing_cl = await db.execute(
-                    select(CampaignLead).where(
-                        CampaignLead.campaign_id == campaign_id,
-                        CampaignLead.lead_id == lead.id,
-                    )
-                )
-                if existing_cl.scalar_one_or_none():
-                    results.append({"email": email, "status": "already_enrolled"})
-                    already_enrolled += 1
-                    continue
 
             # Enroll — scheduling happens after all leads are enrolled (see below)
             cl = CampaignLead(campaign_id=campaign_id, lead_id=lead.id)
@@ -2657,6 +2832,18 @@ async def import_campaign_leads(
     )
     has_personalized_import = (pers_check_import.scalar() or 0) > 0
 
+    standard_sequences_result = await db.execute(
+        select(Sequence)
+        .options(selectinload(Sequence.variants))
+        .where(
+            Sequence.campaign_id == campaign_id,
+            Sequence.sequence_type == "standard",
+        )
+        .order_by(Sequence.position)
+    )
+    standard_sequences = standard_sequences_result.unique().scalars().all()
+    required_csv_fields = _standard_sequence_required_variables(standard_sequences)
+
     contents = await file.read()
     text = contents.decode("utf-8-sig")  # handle BOM from Excel
 
@@ -2682,28 +2869,54 @@ async def import_campaign_leads(
 
         valid_emails: list[str] = []
         invalid_format: list[str] = []
+        missing_required_fields: list[dict] = []
+        results_list: list[dict] = []
         seen: set[str] = set()
         dup_count = 0
         preview_reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-        for _ in preview_reader:
-            by_header = {}
-            for fk in preview_reader.fieldnames or []:
-                h = (fk or "").strip()
-                if not h:
-                    continue
-                raw_val = _.get(fk)
-                by_header[h] = raw_val.strip() if raw_val else ""
-            email = next(
-                (by_header[h] for h in raw_headers if h.lower() == "email"), ""
-            ).strip().lower()
+        for row_num, row in enumerate(preview_reader, start=2):
+            by_header = _csv_row_by_header(row, preview_reader.fieldnames or [])
+            email, name, custom_data = _csv_row_identity_and_custom_data(
+                by_header, raw_headers
+            )
             if not email or "@" not in email:
                 invalid_format.append(email or "(empty)")
+                results_list.append(
+                    {
+                        "row": row_num,
+                        "email": email,
+                        "status": "invalid_format",
+                        "detail": "Email is empty or invalid",
+                    }
+                )
+                continue
+            row_template_data = {
+                "email": email,
+                "name": name,
+                "unsubscribe_link": "https://example.invalid/unsubscribe",
+                **custom_data,
+            }
+            missing = sorted(required_csv_fields - row_template_data.keys())
+            if missing:
+                issue = {"row": row_num, "email": email, "missing_fields": missing}
+                missing_required_fields.append(issue)
+                results_list.append(
+                    {
+                        **issue,
+                        "status": "missing_required_fields",
+                        "detail": "Missing content required by campaign templates",
+                    }
+                )
                 continue
             if email in seen:
                 dup_count += 1
+                results_list.append(
+                    {"row": row_num, "email": email, "status": "duplicate_in_file"}
+                )
                 continue
             seen.add(email)
             valid_emails.append(email)
+            results_list.append({"row": row_num, "email": email, "status": "valid"})
 
         domain_cache: dict[str, str] = {}
         provider_counts: dict[str, int] = defaultdict(int)
@@ -2718,16 +2931,15 @@ async def import_campaign_leads(
             "preview": True,
             "total_valid": len(valid_emails),
             "providers": dict(sorted(provider_counts.items(), key=lambda x: -x[1])),
-            "total_flagged": len(invalid_format) + dup_count,
+            "required_fields": sorted(required_csv_fields),
+            "results": results_list,
+            "total_flagged": len(invalid_format) + dup_count + len(missing_required_fields),
             "flagged": {
                 "invalid_format": invalid_format,
                 "duplicates_in_batch": dup_count,
+                "missing_required_fields": missing_required_fields,
             },
         }
-
-    _csv_reserved_lower = frozenset(
-        {"email", "name", "status", "interest", "email_verification_status"}
-    )
 
     added = 0
     already_enrolled = 0
@@ -2739,21 +2951,42 @@ async def import_campaign_leads(
     # Track new enrollments for bulk scheduling after provider detection
     new_enrollments: list[tuple[int, int, str, bool, bool]] = []  # cl.id, lead.id, email, has_prov, can_send
 
-    for row_num, row in enumerate(reader, start=2):
-        by_header = {}
-        for fk in reader.fieldnames or []:
-            h = (fk or "").strip()
-            if not h:
-                continue
-            raw_val = row.get(fk)
-            by_header[h] = raw_val.strip() if raw_val else ""
+    await _lock_lead_import(db)
 
-        email = next(
-            (by_header[h] for h in raw_headers if h.lower() == "email"),
-            "",
-        ).strip().lower()
-        if not email:
-            results_list.append({"row": row_num, "status": "error", "detail": "Empty email"})
+    for row_num, row in enumerate(reader, start=2):
+        by_header = _csv_row_by_header(row, reader.fieldnames or [])
+        email, name, custom_data = _csv_row_identity_and_custom_data(
+            by_header, raw_headers
+        )
+        if not email or "@" not in email:
+            results_list.append(
+                {
+                    "row": row_num,
+                    "email": email,
+                    "status": "invalid_format",
+                    "detail": "Email is empty or invalid",
+                }
+            )
+            errors += 1
+            continue
+
+        row_template_data = {
+            "email": email,
+            "name": name,
+            "unsubscribe_link": "https://example.invalid/unsubscribe",
+            **custom_data,
+        }
+        missing = sorted(required_csv_fields - row_template_data.keys())
+        if missing:
+            results_list.append(
+                {
+                    "row": row_num,
+                    "email": email,
+                    "status": "missing_required_fields",
+                    "missing_fields": missing,
+                    "detail": "Missing content required by campaign templates",
+                }
+            )
             errors += 1
             continue
 
@@ -2763,18 +2996,6 @@ async def import_campaign_leads(
             continue
         seen_emails.add(email)
 
-        name = next(
-            (by_header[h] for h in raw_headers if h.lower() == "name"),
-            "",
-        )
-        custom_data = {}
-        for h in raw_headers:
-            if not h or h.lower() in _csv_reserved_lower:
-                continue
-            v = by_header.get(h, "")
-            if v:
-                custom_data[h] = v
-
         def _csv_cell(field_lower: str):
             for h in raw_headers:
                 if h.lower() == field_lower:
@@ -2783,8 +3004,35 @@ async def import_campaign_leads(
             return None
 
         try:
-            lead_result = await db.execute(select(Lead).where(Lead.email == email))
+            lead_result = await db.execute(
+                select(Lead)
+                .where(func.lower(Lead.email) == email)
+                .order_by(Lead.id)
+                .limit(1)
+            )
             lead = lead_result.scalar_one_or_none()
+            if lead is not None:
+                if skip_duplicates:
+                    enrollment_check = await db.execute(
+                        select(CampaignLead.id)
+                        .where(CampaignLead.lead_id == lead.id)
+                        .limit(1)
+                    )
+                else:
+                    enrollment_check = await db.execute(
+                        select(CampaignLead.id).where(
+                            CampaignLead.campaign_id == campaign_id,
+                            CampaignLead.lead_id == lead.id,
+                        ).limit(1)
+                    )
+                if enrollment_check.scalar_one_or_none() is not None:
+                    if skip_duplicates:
+                        duplicate_leads.append(email)
+                    results_list.append(
+                        {"row": row_num, "email": email, "status": "already_enrolled"}
+                    )
+                    already_enrolled += 1
+                    continue
             if not lead:
                 lead = Lead(email=email, name=name, custom_data=custom_data)
                 db.add(lead)
@@ -2801,29 +3049,6 @@ async def import_campaign_leads(
                         changed = True
                 if changed:
                     await db.flush()
-
-            if skip_duplicates:
-                # Global check: skip if enrolled in any campaign
-                existing_any = await db.execute(
-                    select(CampaignLead).where(CampaignLead.lead_id == lead.id)
-                )
-                if existing_any.scalar_one_or_none():
-                    duplicate_leads.append(email)
-                    results_list.append({"row": row_num, "email": email, "status": "already_enrolled"})
-                    already_enrolled += 1
-                    continue
-            else:
-                # Only check this campaign to avoid a DB constraint violation
-                existing_cl = await db.execute(
-                    select(CampaignLead).where(
-                        CampaignLead.campaign_id == campaign_id,
-                        CampaignLead.lead_id == lead.id,
-                    )
-                )
-                if existing_cl.scalar_one_or_none():
-                    results_list.append({"row": row_num, "email": email, "status": "already_enrolled"})
-                    already_enrolled += 1
-                    continue
 
             cl = CampaignLead(campaign_id=campaign_id, lead_id=lead.id)
             db.add(cl)
@@ -2923,7 +3148,9 @@ async def import_campaign_leads(
         "duplicate_leads": duplicate_leads,
         "duplicates_in_batch": duplicates_in_batch,
         "errors": errors,
-        "total_rows": added + already_enrolled + duplicates_in_batch + errors,
+        "total_rows": len(results_list),
+        "required_fields": sorted(required_csv_fields),
+        "results": results_list,
         "verification_queued": verify_emails and bool(added_lead_ids_csv),
     }
 

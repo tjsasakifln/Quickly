@@ -19,8 +19,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Inbox, GmailAccount, Office365Account, AppSetting, SmtpAccount
-from app.smtp_utils import derive_inbox_health
+from app.models import (
+    Inbox,
+    GmailAccount,
+    Office365Account,
+    AppSetting,
+    SmtpAccount,
+    SmtpSyncState,
+)
+from app.smtp_utils import (
+    derive_imap_sync_status,
+    derive_inbox_health,
+    smtp_followup_hold_reason,
+)
 
 log = logging.getLogger("quickly.system_health")
 
@@ -241,6 +252,7 @@ async def get_system_health(db: AsyncSession = Depends(get_db)):
     smtp_rows = await db.execute(
         select(SmtpAccount, Inbox).join(Inbox, SmtpAccount.inbox_id == Inbox.id).order_by(SmtpAccount.created_at.desc())
     )
+    smtp_sync_rows = await db.execute(select(SmtpSyncState))
     inbox_rows = await db.execute(select(Inbox).order_by(Inbox.id))
     ai_settings_rows = await db.execute(select(AppSetting).where(AppSetting.key.like("ai_%")))
 
@@ -250,6 +262,7 @@ async def get_system_health(db: AsyncSession = Depends(get_db)):
     gmail_rows_list = gmail_rows.all()
     o365_rows_list = o365_rows.all()
     smtp_rows_list = smtp_rows.all()
+    smtp_sync_by_inbox = {state.inbox_id: state for state in smtp_sync_rows.scalars().all()}
     # Health lookups for SMTP inboxes (used by both the smtp and inbox sections).
     smtp_by_inbox: dict[int, SmtpAccount] = {sa.inbox_id: sa for sa, _inbox in smtp_rows_list}
     inbox_list = list(inbox_rows.scalars().all())
@@ -454,6 +467,8 @@ async def get_system_health(db: AsyncSession = Depends(get_db)):
     # ------------------------------------------------------------------
     smtp_accounts = []
     for sa, inbox in smtp_rows_list:
+        sync_state = smtp_sync_by_inbox.get(sa.inbox_id)
+        imap_hold_reason = smtp_followup_hold_reason(sa, sync_state)
         smtp_accounts.append({
             "id": sa.id,
             "inbox_id": sa.inbox_id,
@@ -464,6 +479,22 @@ async def get_system_health(db: AsyncSession = Depends(get_db)):
             "smtp_use_tls": bool(sa.smtp_use_tls),
             "smtp_use_ssl": bool(sa.smtp_use_ssl),
             "imap_configured": bool((sa.imap_host or "").strip()),
+            "imap_sync_status": derive_imap_sync_status(sa, sync_state),
+            "imap_followups_on_hold": bool(imap_hold_reason),
+            "imap_followup_hold_reason": imap_hold_reason or "",
+            "last_imap_sync_attempt_at": (
+                sync_state.last_attempt_at.isoformat()
+                if sync_state is not None and sync_state.last_attempt_at
+                else None
+            ),
+            "last_imap_sync_success_at": (
+                (sync_state.last_success_at or sync_state.last_sync_at).isoformat()
+                if sync_state is not None and (sync_state.last_success_at or sync_state.last_sync_at)
+                else None
+            ),
+            "last_imap_sync_error": (
+                sync_state.last_error if sync_state is not None else ""
+            ) or "",
             "last_tested_at": sa.last_tested_at.isoformat() if sa.last_tested_at else None,
             "last_test_ok": bool(sa.last_test_ok),
             "last_test_error": sa.last_test_error or "",

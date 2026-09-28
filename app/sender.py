@@ -108,12 +108,49 @@ def _log_gmail_call(
         log.warning("Could not write to gmail log file at %s", _GMAIL_LOG_PATH)
 
 
+_TEMPLATE_VARIABLE_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+
+def extract_template_variables(*templates: str | None) -> set[str]:
+    """Return the distinct ``{{variable}}`` names used by *templates*.
+
+    This intentionally uses the same variable grammar as :func:`render_body`
+    so validation and rendering cannot disagree about what is a placeholder.
+    """
+    return {
+        match.group(1)
+        for template in templates
+        if template
+        for match in _TEMPLATE_VARIABLE_RE.finditer(template)
+    }
+
+
+def unresolved_template_variables(
+    templates: str | None | list[str | None] | tuple[str | None, ...],
+    lead_data: Dict[str, Any],
+) -> list[str]:
+    """Return sorted template variables that have no value in *lead_data*.
+
+    Empty strings are considered values for backwards compatibility (notably
+    ``name`` is always present, even for nameless leads).  A key is unresolved
+    only when it is absent or explicitly ``None``.
+    """
+    if isinstance(templates, (str, type(None))):
+        template_items = (templates,)
+    else:
+        template_items = templates
+    required = extract_template_variables(*template_items)
+    return sorted(
+        key for key in required if key not in lead_data or lead_data[key] is None
+    )
+
+
 def render_body(body: str, lead_data: Dict[str, Any]) -> str:
     """Replace {{field}} with lead_data[field]. Supports {{name}}, {{email}}, {{company}}, etc."""
     def repl(match: re.Match) -> str:
         key = match.group(1).strip()
         return str(lead_data.get(key, match.group(0)))
-    return re.sub(r"\{\{\s*(\w+)\s*\}\}", repl, body)
+    return _TEMPLATE_VARIABLE_RE.sub(repl, body)
 
 
 def get_lead_data(lead) -> Dict[str, Any]:

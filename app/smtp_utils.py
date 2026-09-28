@@ -9,16 +9,86 @@ from __future__ import annotations
 
 import imaplib
 import logging
+import os
 import smtplib
 import socket
 import ssl
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from email import policy as _email_policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 
 log = logging.getLogger("quickly.smtp")
+
+
+def imap_sync_stale_after() -> timedelta:
+    """Maximum age of a successful IMAP poll before follow-ups are held.
+
+    The scheduled poll runs every five minutes by default.  Fifteen minutes
+    tolerates two missed runs without allowing a prolonged blind spot.  The
+    environment override is intentionally bounded to avoid an accidental zero
+    or extremely large value disabling the safety gate.
+    """
+    raw = os.getenv("QUICKLY_IMAP_SYNC_STALE_MINUTES", "15")
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError):
+        minutes = 15
+    return timedelta(minutes=max(5, min(minutes, 24 * 60)))
+
+
+def smtp_followup_hold_reason(
+    account,
+    sync_state,
+    *,
+    now: datetime | None = None,
+    stale_after: timedelta | None = None,
+) -> str | None:
+    """Return why an SMTP follow-up must be held, or ``None`` if safe.
+
+    Send-only SMTP accounts are unchanged: the gate applies only when IMAP is
+    configured.  Callers must apply this helper to ``sequence_index > 0`` so a
+    first contact remains deliverable while reply detection is unavailable.
+    """
+    if not account or not (getattr(account, "imap_host", "") or "").strip():
+        return None
+
+    if sync_state is None:
+        return "IMAP reply sync has not completed successfully yet"
+
+    error = (getattr(sync_state, "last_error", "") or "").strip()
+    if error:
+        return f"IMAP reply sync is failing: {error}"
+
+    last_success = (
+        getattr(sync_state, "last_success_at", None)
+        or getattr(sync_state, "last_sync_at", None)
+    )
+    if last_success is None:
+        return "IMAP reply sync has not completed successfully yet"
+
+    if now is None:
+        from app.time import utcnow
+
+        now = utcnow()
+    threshold = stale_after or imap_sync_stale_after()
+    if now - last_success > threshold:
+        age_minutes = max(0, int((now - last_success).total_seconds() // 60))
+        return f"IMAP reply sync is stale ({age_minutes} minutes since last success)"
+    return None
+
+
+def derive_imap_sync_status(account, sync_state, *, now: datetime | None = None) -> str:
+    """Return ``not_configured`` / ``healthy`` / ``failing`` / ``stale``."""
+    if not account or not (getattr(account, "imap_host", "") or "").strip():
+        return "not_configured"
+    reason = smtp_followup_hold_reason(account, sync_state, now=now)
+    if reason is None:
+        return "healthy"
+    if (getattr(sync_state, "last_error", "") or "").strip():
+        return "failing"
+    return "stale"
 
 
 def _verified_ssl_context() -> ssl.SSLContext:

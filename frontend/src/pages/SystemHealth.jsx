@@ -266,7 +266,8 @@ function CheckMeta({ check }) {
       <div className="mt-1 space-y-2 border-t border-gray-100 pt-2">
         <p className="text-xs text-gray-400 font-medium uppercase tracking-wide">SMTP inboxes</p>
         {check.meta.accounts.map(acc => {
-          const failing = !!acc.last_send_error || acc.health === 'failing';
+          const imapOnHold = acc.imap_configured && acc.imap_followups_on_hold;
+          const failing = !!acc.last_send_error || acc.health === 'failing' || imapOnHold;
           const unknown = !failing && acc.health === 'unknown';
           return (
             <div key={acc.id} className="flex flex-col gap-0.5">
@@ -286,6 +287,17 @@ function CheckMeta({ check }) {
               {acc.last_send_error && (
                 <p className="text-xs text-red-400 truncate ml-1">
                   {acc.last_send_at ? new Date(acc.last_send_at).toLocaleString() + ': ' : ''}{acc.last_send_error}
+                </p>
+              )}
+              {acc.imap_configured && (
+                <p className={`text-xs ml-1 ${imapOnHold ? 'text-red-500' : 'text-green-600'}`}>
+                  IMAP sync: {acc.imap_sync_status || 'unknown'}
+                  {acc.last_imap_sync_success_at ? ` · last success ${new Date(acc.last_imap_sync_success_at).toLocaleString()}` : ''}
+                </p>
+              )}
+              {imapOnHold && (
+                <p className="text-xs text-red-500 ml-1">
+                  Follow-ups on hold: {acc.imap_followup_hold_reason || acc.last_imap_sync_error || 'reply sync unavailable'}
                 </p>
               )}
             </div>

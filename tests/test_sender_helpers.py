@@ -1,6 +1,12 @@
 from types import SimpleNamespace
 
-from app.sender import _build_email_message, render_body, get_lead_data
+from app.sender import (
+    _build_email_message,
+    extract_template_variables,
+    get_lead_data,
+    render_body,
+    unresolved_template_variables,
+)
 
 
 def test_render_body_replaces_known_placeholders_and_leaves_unknown():
@@ -11,6 +17,18 @@ def test_render_body_replaces_known_placeholders_and_leaves_unknown():
     assert "Acme" in out
     # unknown placeholder should remain unchanged
     assert "{{missing}}" in out
+
+
+def test_template_validation_uses_same_grammar_without_changing_render_compatibility():
+    templates = ("Olá {{ name }} — {{assunto_1}}", "{{mensagem_1}} / {{missing}}")
+    assert extract_template_variables(*templates) == {
+        "name", "assunto_1", "mensagem_1", "missing",
+    }
+    assert unresolved_template_variables(
+        templates,
+        {"name": "", "assunto_1": "Assunto", "mensagem_1": "Texto"},
+    ) == ["missing"]
+    assert render_body("{{missing}}", {}) == "{{missing}}"
 
 
 def test_get_lead_data_includes_custom_data_and_defaults():

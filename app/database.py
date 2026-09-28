@@ -159,6 +159,9 @@ async def _run_migrations(conn) -> None:
             uidvalidity BIGINT,
             last_uid INTEGER NOT NULL DEFAULT 0,
             last_sync_at TIMESTAMP WITHOUT TIME ZONE,
+            last_attempt_at TIMESTAMP WITHOUT TIME ZONE,
+            last_success_at TIMESTAMP WITHOUT TIME ZONE,
+            last_error TEXT NOT NULL DEFAULT '',
             created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
             updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         )
@@ -210,8 +213,24 @@ async def _run_migrations(conn) -> None:
         "ALTER TABLE smtp_account ADD COLUMN IF NOT EXISTS last_diagnostic_json TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE smtp_account ADD COLUMN IF NOT EXISTS last_send_error TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE smtp_account ADD COLUMN IF NOT EXISTS last_send_at TIMESTAMP WITHOUT TIME ZONE NULL",
+        # 2026-09-27: crash-safe SMTP delivery attempt state.  Existing rows
+        # are known historical sends and therefore backfill to ``sent``.
+        "ALTER TABLE email_log ADD COLUMN IF NOT EXISTS delivery_state VARCHAR(16) NOT NULL DEFAULT 'sent'",
+        "ALTER TABLE email_log ADD COLUMN IF NOT EXISTS delivery_error TEXT NOT NULL DEFAULT ''",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_email_log_active_delivery_attempt ON email_log (lead_id, campaign_id, sequence_index) WHERE delivery_state IN ('sending', 'uncertain')",
+        # 2026-09-27: persistent IMAP poll health.  Backfill the success time
+        # from the legacy last_sync_at checkpoint so upgrades do not put all
+        # existing follow-ups on hold until the next scheduled poll.
+        "ALTER TABLE smtp_sync_state ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP WITHOUT TIME ZONE NULL",
+        "ALTER TABLE smtp_sync_state ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMP WITHOUT TIME ZONE NULL",
+        "ALTER TABLE smtp_sync_state ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT ''",
+        "UPDATE smtp_sync_state SET last_success_at = last_sync_at WHERE last_success_at IS NULL AND last_sync_at IS NOT NULL",
         # 2026-09-22: per-campaign RFC 8058 one-click unsubscribe toggle
         "ALTER TABLE campaign ADD COLUMN IF NOT EXISTS add_one_click_unsubscribe BOOLEAN NOT NULL DEFAULT TRUE",
+        # 2026-09-27: optional exact per-inbox send cadence.  NULL deliberately
+        # retains legacy wait_minutes_between + max_jitter_seconds behavior.
+        "ALTER TABLE inbox ADD COLUMN IF NOT EXISTS min_wait_seconds INTEGER NULL",
+        "ALTER TABLE inbox ADD COLUMN IF NOT EXISTS max_wait_seconds INTEGER NULL",
     ]
     # custom_email_override table (IF NOT EXISTS — must be a separate stmt
     # because it uses raw SQL, not ALTER TABLE)

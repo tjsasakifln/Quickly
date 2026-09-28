@@ -36,6 +36,14 @@ log = logging.getLogger("quickly.routes")
 router = APIRouter(prefix="/api/inboxes", tags=["inboxes"])
 
 
+def _validate_precise_cadence(minimum: int | None, maximum: int | None) -> None:
+    """Ensure the optional second-level cadence is configured atomically."""
+    if (minimum is None) != (maximum is None):
+        raise HTTPException(422, "min_wait_seconds and max_wait_seconds must be set together")
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise HTTPException(422, "min_wait_seconds cannot exceed max_wait_seconds")
+
+
 def _parse_beacon_setup_url(raw: str) -> tuple[str, str]:
     """Return (beacon_base_url, setup_token) from a Beacon setup URL."""
     p = urlparse(raw.strip())
@@ -224,6 +232,7 @@ async def list_inboxes(db: AsyncSession = Depends(get_db)):
 
 @router.post("", response_model=InboxResponse)
 async def create_inbox(data: InboxCreate, db: AsyncSession = Depends(get_db)):
+    _validate_precise_cadence(data.min_wait_seconds, data.max_wait_seconds)
     # Normalise tracking domain: strip scheme, paths, whitespace
     td = _normalise_tracking_domain(data.tracking_domain)
     inbox = Inbox(
@@ -232,6 +241,8 @@ async def create_inbox(data: InboxCreate, db: AsyncSession = Depends(get_db)):
         max_emails_per_day=data.max_emails_per_day,
         wait_minutes_between=data.wait_minutes_between,
         max_jitter_seconds=data.max_jitter_seconds,
+        min_wait_seconds=data.min_wait_seconds,
+        max_wait_seconds=data.max_wait_seconds,
         provider=data.provider,
         tracking_domain=td or None,
         ramp_up_enabled=data.ramp_up_enabled,
@@ -308,6 +319,12 @@ async def update_inbox(
     inbox = result.scalar_one_or_none()
     if not inbox:
         raise HTTPException(404, "Inbox not found")
+
+    # PATCH may update either side, so validate the resulting configuration.
+    supplied = data.model_fields_set
+    proposed_min = data.min_wait_seconds if "min_wait_seconds" in supplied else inbox.min_wait_seconds
+    proposed_max = data.max_wait_seconds if "max_wait_seconds" in supplied else inbox.max_wait_seconds
+    _validate_precise_cadence(proposed_min, proposed_max)
     
     capacity_changed = False
     if data.display_name is not None:
@@ -320,6 +337,12 @@ async def update_inbox(
         capacity_changed = True
     if data.max_jitter_seconds is not None:
         inbox.max_jitter_seconds = data.max_jitter_seconds
+        capacity_changed = True
+    if "min_wait_seconds" in data.model_fields_set:
+        inbox.min_wait_seconds = data.min_wait_seconds
+        capacity_changed = True
+    if "max_wait_seconds" in data.model_fields_set:
+        inbox.max_wait_seconds = data.max_wait_seconds
         capacity_changed = True
     if data.provider is not None:
         inbox.provider = data.provider
@@ -614,10 +637,31 @@ async def delete_inbox(inbox_id: int, db: AsyncSession = Depends(get_db)):
     inbox = result.scalar_one_or_none()
     if not inbox:
         raise HTTPException(404, "Inbox not found")
-    # Remove campaign assignments referencing this inbox
-    await db.execute(
-        CampaignInbox.__table__.delete().where(CampaignInbox.inbox_id == inbox_id)
+    # Removing an assigned inbox silently changes campaign routing and can
+    # orphan already planned work.  Require the operator to detach it from all
+    # campaigns (or pause/reassign them) explicitly first.
+    assignment = await db.execute(
+        select(CampaignInbox.id)
+        .where(CampaignInbox.inbox_id == inbox_id)
+        .limit(1)
     )
+    if assignment.scalar_one_or_none() is not None:
+        raise HTTPException(
+            400,
+            "Inbox is assigned to one or more campaigns; remove it from those campaigns before deleting it",
+        )
+
+    # Future slots have the same routing implication even if an older campaign
+    # assignment was removed.  They must be cleared/reassigned deliberately.
+    queued = await db.execute(
+        select(QueueSlot.id).where(QueueSlot.inbox_id == inbox_id).limit(1)
+    )
+    if queued.scalar_one_or_none() is not None:
+        raise HTTPException(
+            400,
+            "Inbox has queued sends; pause or reassign its queued sends before deleting it",
+        )
+
     # Nullify inbox_id on email logs (preserve logs, break FK constraint)
     await db.execute(
         EmailLog.__table__.update().where(EmailLog.inbox_id == inbox_id).values(inbox_id=None)

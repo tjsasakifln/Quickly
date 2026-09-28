@@ -413,6 +413,7 @@ function LeadsTab({ leads, campaignId, refresh, onViewQueue }) {
     try { return localStorage.getItem('emailVerifEnabled') === 'true'; } catch { return false; }
   });
   const [lastDuplicates, setLastDuplicates] = useState([]);
+  const [lastImportIssues, setLastImportIssues] = useState([]);
   const [editCell, setEditCell] = useState(null); // { leadId, field }
   const [editValue, setEditValue] = useState('');
   const [importing, setImporting] = useState(false);
@@ -682,6 +683,7 @@ function LeadsTab({ leads, campaignId, refresh, onViewQueue }) {
     if (!file) return;
     setImporting(true);
     setLastDuplicates([]);
+    setLastImportIssues([]);
     try {
       const preview = await api.upload(`/campaigns/${campaignId}/leads/import?confirm_only=true&skip_duplicates=${skipDuplicates}`, file);
       setImportFile(file);
@@ -708,6 +710,9 @@ function LeadsTab({ leads, campaignId, refresh, onViewQueue }) {
         res = await api.upload(`/campaigns/${campaignId}/leads/import?skip_duplicates=${skipDuplicates}&verify_emails=${verifyEmails}`, importFile);
         const dupMsg = res.duplicate_leads?.length ? `, ${res.duplicate_leads.length} duplicate(s) skipped` : '';
         notify({ type: 'success', message: `Imported: ${res.added} added, ${res.already_enrolled} already enrolled, ${res.errors} errors${dupMsg}` });
+        setLastImportIssues((res.results || []).filter(row =>
+          ['invalid_format', 'missing_required_fields', 'error'].includes(row.status)
+        ));
       }
       setShowLeadsConfirm(false);
       setConfirmPreview(null);
@@ -806,6 +811,28 @@ function LeadsTab({ leads, campaignId, refresh, onViewQueue }) {
             ))}
           </div>
           <button className="text-xs text-yellow-600 underline mt-1" onClick={() => setLastDuplicates([])}>Dismiss</button>
+        </div>
+      )}
+
+      {lastImportIssues.length > 0 && (
+        <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+          <div className="flex items-start justify-between gap-3">
+            <p className="text-sm font-medium text-red-800">
+              {lastImportIssues.length} CSV row{lastImportIssues.length !== 1 ? 's' : ''} skipped
+            </p>
+            <button className="text-xs text-red-600 underline" onClick={() => setLastImportIssues([])}>Dismiss</button>
+          </div>
+          <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
+            {lastImportIssues.map((issue, i) => (
+              <div key={`${issue.row}-${issue.email || i}`} className="text-xs text-red-700">
+                <span className="font-medium">Row {issue.row}</span>
+                {issue.email ? <span className="font-mono"> · {issue.email}</span> : null}
+                {issue.missing_fields?.length
+                  ? <span> · missing: {issue.missing_fields.join(', ')}</span>
+                  : <span> · {issue.detail || issue.status}</span>}
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -1222,12 +1249,26 @@ function LeadsTab({ leads, campaignId, refresh, onViewQueue }) {
                 {confirmPreview.flagged?.duplicates_in_batch > 0 && (
                   <p className="text-xs text-yellow-700 mt-1">{confirmPreview.flagged.duplicates_in_batch} duplicate(s) within batch</p>
                 )}
+                {confirmPreview.flagged?.missing_required_fields?.length > 0 && (
+                  <div className="mt-2">
+                    <span className="text-xs text-yellow-700 font-medium">Missing required content:</span>
+                    <div className="mt-1 space-y-1 max-h-36 overflow-y-auto">
+                      {confirmPreview.flagged.missing_required_fields.map((issue, i) => (
+                        <div key={`${issue.row}-${issue.email || i}`} className="text-xs text-yellow-700">
+                          <span className="font-medium">Row {issue.row}</span>
+                          {issue.email ? <span className="font-mono"> · {issue.email}</span> : null}
+                          <span> · {issue.missing_fields.join(', ')}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
             <div className="flex justify-end gap-2 mt-6 pt-3 border-t border-gray-100">
               <Button variant="outline" size="sm" onClick={() => setShowLeadsConfirm(false)}>Cancel</Button>
-              <Button variant="default" size="sm" onClick={handleConfirmAdd} disabled={confirmAddLoading}>
+              <Button variant="default" size="sm" onClick={handleConfirmAdd} disabled={confirmAddLoading || confirmPreview.total_valid === 0}>
                 {confirmAddLoading ? 'Adding…' : `Confirm & Add ${confirmPreview.total_valid} lead${confirmPreview.total_valid !== 1 ? 's' : ''}`}
               </Button>
             </div>
@@ -1555,6 +1596,8 @@ function CampaignAnalyticsTab({ campaignId, campaign, sentData = [], sequences =
               sentData={sentData}
               filter={sentFilter}
               onFilterChange={setSentFilter}
+              campaignId={campaignId}
+              onRefresh={onRefresh}
             />
           )}
         </div>
@@ -1693,7 +1736,24 @@ const SENT_FILTER_OPTIONS = [
   { value: 'unsubscribed', label: 'Unsubscribed' },
 ];
 
-function SentEmailsPanel({ sentData = [], filter, onFilterChange }) {
+function SentEmailsPanel({ sentData = [], filter, onFilterChange, campaignId, onRefresh }) {
+  const confirm = useConfirm();
+  const notify = useNotify();
+  const [resolvingLogId, setResolvingLogId] = useState(null);
+  const resolveDelivery = async (email, action) => {
+    const verb = action === 'mark_sent' ? 'mark this attempt as sent' : 'retry this campaign step';
+    if (!await confirm(`Explicitly ${verb}? SMTP cannot prove the previous outcome automatically.`)) return;
+    setResolvingLogId(email.log_id);
+    try {
+      await api.post(`/campaigns/${campaignId}/sent/${email.log_id}/resolve`, { action });
+      notify({ type: 'success', message: action === 'mark_sent' ? 'Delivery marked as sent.' : 'Step released for an explicit retry.' });
+      await onRefresh?.();
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Could not resolve uncertain delivery' });
+    } finally {
+      setResolvingLogId(null);
+    }
+  };
   const filtered = useMemo(() => {
     switch (filter) {
       case 'opened':      return sentData.filter(e => e.opened);
@@ -1783,6 +1843,26 @@ function SentEmailsPanel({ sentData = [], filter, onFilterChange }) {
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex flex-wrap gap-1">
+                      {e.delivery_state === 'uncertain' && (
+                        <>
+                          <span
+                            className="bg-amber-100 text-amber-800 border border-amber-200 rounded px-1.5 py-0.5"
+                            title={e.delivery_error || 'SMTP result was not recorded; automatic retry was blocked'}
+                          >
+                            Delivery uncertain
+                          </span>
+                          <button
+                            className="text-[10px] underline text-amber-800 disabled:opacity-50"
+                            disabled={resolvingLogId === e.log_id}
+                            onClick={() => resolveDelivery(e, 'mark_sent')}
+                          >Mark sent</button>
+                          <button
+                            className="text-[10px] underline text-red-700 disabled:opacity-50"
+                            disabled={resolvingLogId === e.log_id}
+                            onClick={() => resolveDelivery(e, 'retry')}
+                          >Retry</button>
+                        </>
+                      )}
                       {e.lead_status && e.lead_status !== 'active' && (
                         <StatusBadge label={e.lead_status} />
                       )}

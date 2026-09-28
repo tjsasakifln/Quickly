@@ -93,10 +93,39 @@ def _apply_jitter(dt: datetime, inbox) -> datetime:
 
     Returns dt unchanged when the inbox has no jitter configured (0 or unset).
     """
+    # Precise cadence already samples the complete gap.  Applying the legacy
+    # jitter on top would violate its configured upper bound.
+    if _has_precise_cadence(inbox):
+        return dt
     max_s = getattr(inbox, "max_jitter_seconds", 0)
     if not max_s:
         return dt
     return dt + timedelta(seconds=random.randint(0, max_s))
+
+
+def _has_precise_cadence(inbox) -> bool:
+    """Whether an inbox opted into the second-level cadence range."""
+    minimum = getattr(inbox, "min_wait_seconds", None)
+    maximum = getattr(inbox, "max_wait_seconds", None)
+    return (
+        minimum is not None
+        and maximum is not None
+        and 1 <= minimum <= maximum <= 3600
+    )
+
+
+def _next_cadence_seconds(inbox) -> int:
+    """Return one safe gap for the inbox, preserving the legacy policy."""
+    if _has_precise_cadence(inbox):
+        return random.randint(inbox.min_wait_seconds, inbox.max_wait_seconds)
+    return max(1, int(getattr(inbox, "wait_minutes_between", 5) or 5)) * 60
+
+
+def minimum_send_gap_seconds(inbox) -> int:
+    """Runtime lower bound between accepted sends for an inbox."""
+    if _has_precise_cadence(inbox):
+        return int(inbox.min_wait_seconds)
+    return max(1, int(getattr(inbox, "wait_minutes_between", 5) or 5)) * 60
 
 
 # ── Timezone helpers ───────────────────────────────────────────────────────────
@@ -327,6 +356,7 @@ async def _get_preferred_inbox_for_lead(
             EmailLog.lead_id == lead_id,
             EmailLog.campaign_id == campaign_id,
             EmailLog.inbox_id.isnot(None),
+            EmailLog.delivery_state == "sent",
         )
         .order_by(EmailLog.sent_at.desc())
         .limit(1)
@@ -663,11 +693,20 @@ async def reserve_slots_for_lead(
                     # Today: check if estimated grid time is in the past (campaign-local)
                     est_time = _estimated_send_time(sending_start, wait_min, pos)
                     if est_time <= now.time():
-                        next_dt = await _next_available_send_time_today(
-                            session, inbox_id, today,
-                            sending_start, sending_end, wait_min, now,
-                            cache, campaign=campaign,
-                        )
+                        if _has_precise_cadence(inbox_obj) and last_actual_dt is not None:
+                            # A second-level cadence must not be pulled back to
+                            # the legacy minute grid.  The latest cached slot is
+                            # after every existing slot for this inbox/day.
+                            next_dt = max(
+                                last_actual_dt + timedelta(seconds=_next_cadence_seconds(inbox_obj)),
+                                now + timedelta(seconds=1),
+                            )
+                        else:
+                            next_dt = await _next_available_send_time_today(
+                                session, inbox_id, today,
+                                sending_start, sending_end, wait_min, now,
+                                cache, campaign=campaign,
+                            )
                         if next_dt is not None:
                             # Chain from the last jittered send time to guarantee
                             # the minimum wait gap.  _next_available_send_time_today
@@ -676,8 +715,11 @@ async def reserve_slots_for_lead(
                             # shrink below wait_min.  Taking max(grid, last+wait_min)
                             # mirrors the "future day" chaining logic that works correctly.
                             if last_actual_dt is not None:
-                                chained_dt = last_actual_dt + timedelta(minutes=wait_min)
-                                base_local_dt = max(next_dt, chained_dt)
+                                if _has_precise_cadence(inbox_obj):
+                                    base_local_dt = next_dt
+                                else:
+                                    chained_dt = last_actual_dt + timedelta(seconds=_next_cadence_seconds(inbox_obj))
+                                    base_local_dt = max(next_dt, chained_dt)
                             else:
                                 base_local_dt = next_dt
                             # If chaining pushed us past the sending window, move to
@@ -718,7 +760,7 @@ async def reserve_slots_for_lead(
                         # Grid time is still in the future — chain from the last jittered slot
                         # so the actual gap between consecutive emails stays >= wait_min.
                         base_local_dt = (
-                            last_actual_dt + timedelta(minutes=wait_min)
+                            last_actual_dt + timedelta(seconds=_next_cadence_seconds(inbox_obj))
                             if last_actual_dt is not None
                             else datetime.combine(current_date, est_time)
                         )
@@ -736,7 +778,7 @@ async def reserve_slots_for_lead(
                     # Future day — chain from last jittered slot or fall back to grid.
                     est_t = _estimated_send_time(sending_start, wait_min, pos)
                     base_local_dt = (
-                        last_actual_dt + timedelta(minutes=wait_min)
+                        last_actual_dt + timedelta(seconds=_next_cadence_seconds(inbox_obj))
                         if last_actual_dt is not None
                         else datetime.combine(current_date, est_t)
                     )
@@ -1145,6 +1187,7 @@ async def _recalculate_queue_for_campaign_leads(
         .where(
             EmailLog.lead_id.in_(lead_ids),
             EmailLog.campaign_id == campaign_id,
+            EmailLog.delivery_state == "sent",
         )
         .group_by(EmailLog.lead_id)
     )
@@ -1162,6 +1205,7 @@ async def _recalculate_queue_for_campaign_leads(
         .where(
             EmailLog.lead_id.in_(lead_ids),
             EmailLog.campaign_id == campaign_id,
+            EmailLog.delivery_state == "sent",
             EmailLog.inbox_id.isnot(None),
         )
         .distinct(EmailLog.lead_id)
@@ -1542,7 +1586,11 @@ async def recalculate_queue_round_robin(
                 func.max(EmailLog.sequence_index).label("max_seq"),
                 func.max(EmailLog.sent_at).label("last_sent_at"),
             )
-            .where(EmailLog.lead_id.in_(lead_ids_c), EmailLog.campaign_id == cid)
+            .where(
+                EmailLog.lead_id.in_(lead_ids_c),
+                EmailLog.campaign_id == cid,
+                EmailLog.delivery_state == "sent",
+            )
             .group_by(EmailLog.lead_id)
         )
         lead_last_sent: dict = {}
@@ -1563,6 +1611,7 @@ async def recalculate_queue_round_robin(
                 EmailLog.lead_id.in_(lead_ids_c),
                 EmailLog.campaign_id == cid,
                 EmailLog.inbox_id.isnot(None),
+                EmailLog.delivery_state == "sent",
             )
             .distinct(EmailLog.lead_id)
             .order_by(EmailLog.lead_id, EmailLog.sent_at.desc())

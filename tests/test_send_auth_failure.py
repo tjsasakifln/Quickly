@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import func, select
 
 import app.jobs as jobs_mod
-from app.models import EmailLog, QueueSlot, SmtpAccount
+from app.models import CampaignLead, EmailLog, QueueSlot, Sequence, SmtpAccount, SmtpSyncState
 from app.sender import SendFailure, SendResult
 from tests.conftest import (
     make_campaign,
@@ -178,16 +178,23 @@ async def test_sender_display_name_renders_lead_variables(session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_send_email_raising_removes_precreated_email_log(session, monkeypatch):
-    """An unexpected exception from send_email must not leave an orphan EmailLog.
+async def test_send_email_raising_marks_delivery_uncertain_and_blocks_retry(session, monkeypatch):
+    """A transport exception may happen after SMTP accepted the message.
 
-    The row is committed *before* the network call (so tracking tokens exist),
-    so without cleanup a crash would consume the inbox's daily quota, inflate
-    campaign ``emails_sent`` and make queue recalculation think the step had
-    already been sent.
+    Preserve the attempt as uncertain and remove its slot instead of retrying
+    blindly and risking a duplicate.
     """
     inbox = await _make_smtp_inbox(session, email="boom@example.com")
     slot = await _make_due_slot(session, inbox)
+    cl = await session.get(CampaignLead, slot.campaign_lead_id)
+    await make_sequence(session, cl.campaign_id, position=1, subject="Future")
+    await make_queue_slot(
+        session,
+        cl.id,
+        inbox.id,
+        sequence_index=1,
+        scheduled_date=datetime.utcnow() + timedelta(hours=1),
+    )
 
     def exploding_send(**kwargs):
         raise RuntimeError("transport exploded")
@@ -205,21 +212,181 @@ async def test_send_email_raising_removes_precreated_email_log(session, monkeypa
     ).scalar()
     assert before == 0
 
-    # The exception must propagate so _dispatch_slot can log it and the slot is
-    # retried by the next scan.
-    with pytest.raises(RuntimeError, match="transport exploded"):
-        await jobs_mod.send_slot_job(slot.id)
+    await jobs_mod.send_slot_job(slot.id)
 
-    remaining = (
-        await session.execute(select(func.count(EmailLog.id)).where(EmailLog.inbox_id == inbox.id))
-    ).scalar()
-    assert remaining == 0, "pre-created EmailLog row must be rolled back"
+    attempt = (
+        await session.execute(select(EmailLog).where(EmailLog.inbox_id == inbox.id))
+    ).scalar_one()
+    assert attempt.delivery_state == "uncertain"
+    assert "transport exploded" in attempt.delivery_error
 
-    # The slot itself is retained so the send can be retried.
+    # The slot is removed so a later scan cannot retry automatically.
     slots = (
         await session.execute(select(func.count(QueueSlot.id)).where(QueueSlot.inbox_id == inbox.id))
     ).scalar()
-    assert slots == 1
+    assert slots == 0
+    await session.refresh(cl)
+    assert cl.sending_paused is True
+
+
+@pytest.mark.asyncio
+async def test_stale_sending_attempt_becomes_uncertain_without_resend(session, monkeypatch):
+    """Restart recovery must not resend a step with an unfinished attempt."""
+    inbox = await _make_smtp_inbox(session, email="restart@example.com")
+    slot = await _make_due_slot(session, inbox)
+    cl = await session.get(CampaignLead, slot.campaign_lead_id)
+    session.add(
+        EmailLog(
+            lead_id=cl.lead_id,
+            campaign_id=cl.campaign_id,
+            inbox_id=inbox.id,
+            sequence_index=slot.sequence_index,
+            subject="Potentially accepted",
+            message_id="",
+            delivery_state="sending",
+        )
+    )
+    await session.commit()
+
+    calls = []
+    monkeypatch.setattr("app.jobs.send_email", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(jobs_mod, "AsyncSessionLocal", lambda: _SessionCtx(session))
+
+    await jobs_mod.send_slot_job(slot.id)
+
+    assert calls == []
+    attempt = (
+        await session.execute(select(EmailLog).where(EmailLog.inbox_id == inbox.id))
+    ).scalar_one()
+    assert attempt.delivery_state == "uncertain"
+    assert "automatic retry was blocked" in attempt.delivery_error
+    assert await session.get(QueueSlot, slot.id) is None
+
+
+@pytest.mark.asyncio
+async def test_unresolved_custom_field_pauses_only_enrollment(session, monkeypatch):
+    inbox = await _make_smtp_inbox(session, email="content@example.com")
+    slot = await _make_due_slot(session, inbox)
+    cl = await session.get(CampaignLead, slot.campaign_lead_id)
+    sequence = (
+        await session.execute(
+            select(Sequence).where(
+                Sequence.campaign_id == cl.campaign_id,
+                Sequence.position == slot.sequence_index,
+            )
+        )
+    ).scalar_one()
+    sequence.subject = "{{assunto_1}}"
+    sequence.body = "{{mensagem_1}}"
+    await session.commit()
+
+    calls = []
+    monkeypatch.setattr("app.jobs.send_email", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(jobs_mod, "AsyncSessionLocal", lambda: _SessionCtx(session))
+
+    await jobs_mod.send_slot_job(slot.id)
+
+    await session.refresh(cl)
+    assert calls == []
+    assert cl.sending_paused is True
+    assert await session.get(QueueSlot, slot.id) is None
+    assert (
+        await session.execute(select(func.count(EmailLog.id)).where(EmailLog.inbox_id == inbox.id))
+    ).scalar() == 0
+
+
+@pytest.mark.asyncio
+async def test_imap_health_holds_followup_then_auto_resumes(session, monkeypatch):
+    inbox = await _make_smtp_inbox(session, email="reply-sync@example.com")
+    smtp_account = (
+        await session.execute(select(SmtpAccount).where(SmtpAccount.inbox_id == inbox.id))
+    ).scalar_one()
+    smtp_account.imap_host = "imap.example.com"
+
+    campaign = await make_campaign(
+        session,
+        sending_days=[0, 1, 2, 3, 4, 5, 6],
+        sending_hours_start="00:00",
+        sending_hours_end="23:59",
+    )
+    await make_sequence(session, campaign.id, position=0)
+    await make_sequence(session, campaign.id, position=1, subject="Follow-up")
+    lead = await make_lead(session, email="followup-lead@example.com")
+    cl = await make_campaign_lead(session, campaign.id, lead.id)
+    await make_campaign_inbox(session, campaign.id, inbox.id)
+    slot = await make_queue_slot(
+        session,
+        cl.id,
+        inbox.id,
+        sequence_index=1,
+        scheduled_date=datetime.utcnow() - timedelta(minutes=1),
+    )
+    await session.commit()
+
+    calls = []
+    monkeypatch.setattr(
+        "app.jobs.send_email",
+        lambda **kwargs: calls.append(kwargs) or SendResult(message_id="<safe>", thread_id="thread"),
+    )
+    monkeypatch.setattr(jobs_mod, "AsyncSessionLocal", lambda: _SessionCtx(session))
+
+    await jobs_mod.send_slot_job(slot.id)
+    assert calls == []
+    assert await session.get(QueueSlot, slot.id) is not None
+
+    session.add(
+        SmtpSyncState(
+            inbox_id=inbox.id,
+            last_attempt_at=datetime.utcnow(),
+            last_success_at=datetime.utcnow(),
+            last_sync_at=datetime.utcnow(),
+            last_error="",
+        )
+    )
+    await session.commit()
+
+    await jobs_mod.send_slot_job(slot.id)
+    assert len(calls) == 1
+    assert await session.get(QueueSlot, slot.id) is None
+    sent = (
+        await session.execute(select(EmailLog).where(EmailLog.inbox_id == inbox.id))
+    ).scalar_one()
+    assert sent.delivery_state == "sent"
+
+
+@pytest.mark.asyncio
+async def test_precise_cadence_runtime_does_not_apply_legacy_minute_wait(session, monkeypatch):
+    inbox = await _make_smtp_inbox(session, email="cadence-runtime@example.com")
+    inbox.wait_minutes_between = 5
+    inbox.min_wait_seconds = 20
+    inbox.max_wait_seconds = 60
+    slot = await _make_due_slot(session, inbox)
+    cl = await session.get(CampaignLead, slot.campaign_lead_id)
+    session.add(
+        EmailLog(
+            lead_id=cl.lead_id,
+            campaign_id=cl.campaign_id,
+            inbox_id=inbox.id,
+            sequence_index=99,
+            subject="Earlier send",
+            message_id="<earlier>",
+            delivery_state="sent",
+            sent_at=datetime.utcnow() - timedelta(seconds=30),
+        )
+    )
+    await session.commit()
+
+    calls = []
+    monkeypatch.setattr(
+        "app.jobs.send_email",
+        lambda **kwargs: calls.append(kwargs) or SendResult(message_id="<next>", thread_id="next"),
+    )
+    monkeypatch.setattr(jobs_mod, "AsyncSessionLocal", lambda: _SessionCtx(session))
+
+    await jobs_mod.send_slot_job(slot.id)
+
+    assert len(calls) == 1
+    assert await session.get(QueueSlot, slot.id) is None
 
 
 @pytest.mark.asyncio

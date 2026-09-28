@@ -99,6 +99,8 @@ class InboxCreate(BaseModel):
     max_emails_per_day: int = 50
     wait_minutes_between: int = 5
     max_jitter_seconds: int = 180
+    min_wait_seconds: Optional[int] = Field(default=None, ge=1, le=3600)
+    max_wait_seconds: Optional[int] = Field(default=None, ge=1, le=3600)
     provider: INBOX_PROVIDERS = "gmail"  # gmail | office365 | smtp
     tracking_domain: Optional[str] = None  # custom hostname for tracking links
     ramp_up_enabled: bool = False
@@ -112,6 +114,8 @@ class InboxUpdate(BaseModel):
     max_emails_per_day: Optional[int] = None
     wait_minutes_between: Optional[int] = None
     max_jitter_seconds: Optional[int] = None
+    min_wait_seconds: Optional[int] = Field(default=None, ge=1, le=3600)
+    max_wait_seconds: Optional[int] = Field(default=None, ge=1, le=3600)
     provider: Optional[INBOX_PROVIDERS] = None
     tracking_domain: Optional[str] = None  # set to "" to clear
     ramp_up_enabled: Optional[bool] = None
@@ -146,6 +150,8 @@ class InboxResponse(BaseModel):
     max_emails_per_day: int
     wait_minutes_between: int
     max_jitter_seconds: int = 180
+    min_wait_seconds: Optional[int] = None
+    max_wait_seconds: Optional[int] = None
     provider: str
     tracking_domain: Optional[str] = None
     beacon_connected: bool = False
