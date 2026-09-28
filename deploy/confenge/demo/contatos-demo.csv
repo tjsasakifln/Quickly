@@ -1,0 +1,13 @@
+email,empresa,nome,segmento,assunto_1,mensagem_1,assunto_2,mensagem_2,assunto_3,mensagem_3,origem
+ana@exemplo.invalid,Construtora Exemplo,Anã,construção,"Olá, {{nome}}","Olá, {{nome}}!
+
+Mensagem demonstrativa com acentos e aspas: ""sem envio"".
+
+Empresa: {{empresa}}.","Retorno para {{empresa}}","Olá, {{nome}}.
+
+Este é o segundo passo de demonstração.","Última mensagem para {{nome}}","Olá, {{nome}}.
+
+Terceiro passo; a campanha deve permanecer pausada.",demo-local
+bruno@exemplo.invalid,"Engenharia & Filhos",Bruno,engenharia,"Proposta para {{empresa}}","Olá, {{nome}}.
+
+Conteúdo aprovado de teste; não entregar.","Acompanhamento {{empresa}}","Olá novamente, {{nome}}.","Encerramento de teste","Mensagem final personalizada para {{nome}}.",demo-local

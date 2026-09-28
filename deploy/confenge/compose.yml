@@ -1,0 +1,57 @@
+name: quickly-confenge
+
+services:
+  db:
+    image: postgres:15-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-quickly}
+      POSTGRES_USER: ${POSTGRES_USER:-quickly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - quickly_confenge_pgdata:/var/lib/postgresql/data
+    networks: [quickly_confenge_internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "5"}
+
+  app:
+    image: ${QUICKLY_IMAGE:?set QUICKLY_IMAGE in .env}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-quickly}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-quickly}
+      QUICKLY_PREBUILT_IMAGE: "1"
+      QUICKLY_LOCAL_DISK_BACKUPS: "1"
+      TZ: America/Sao_Paulo
+    ports:
+      - "127.0.0.1:19080:8000"
+    volumes:
+      - ./app-backups:/app/backups
+    networks: [quickly_confenge_internal]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/auth/setup-status', timeout=5).read()\""]
+      interval: 20s
+      timeout: 8s
+      retries: 6
+      start_period: 30s
+    logging:
+      driver: local
+      options: {max-size: "20m", max-file: "5"}
+
+networks:
+  quickly_confenge_internal:
+    name: quickly_confenge_internal
+
+volumes:
+  quickly_confenge_pgdata:
+    name: quickly_confenge_pgdata
