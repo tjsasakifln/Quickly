@@ -68,7 +68,7 @@ Register the first (admin) user. Closes automatically after the first account is
 
 | Field | Type | Description |
 |---|---|---|
-| `username` | string | 3–150 chars, alphanumeric + hyphens/underscores |
+| `username` | string | 3–150 chars; letters/numbers/hyphens/underscores, with single periods between non-empty components |
 | `email` | string | Valid email address |
 | `password` | string | Min 8 chars, must include uppercase, lowercase, and a digit |
 

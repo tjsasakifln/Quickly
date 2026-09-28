@@ -5,6 +5,7 @@ import asyncio
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.main import app
@@ -13,6 +14,7 @@ from app.rate_limit import limiter
 from app.routers.auth import (
     _FIRST_ADMIN_ADVISORY_LOCK_ID,
     _first_admin_creation_guard,
+    RegisterRequest,
 )
 
 
@@ -91,9 +93,30 @@ async def test_first_admin_registration_and_login_accept_dotted_username(engine)
 
         logged_in = await client.post(
             "/api/auth/login",
-            json={"username": "tiago.sasaki", "password": payload["password"]},
+            json={"username": "Tiago.Sasaki", "password": payload["password"]},
         )
         assert logged_in.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "username",
+    [
+        ".admin",
+        "admin.",
+        "admin..root",
+        "tiago/sasaki",
+        "tiago@sasaki",
+        "tiago'sasaki",
+        "tiago\nsasaki",
+    ],
+)
+def test_registration_rejects_unsafe_or_ambiguous_username(username):
+    with pytest.raises(ValidationError):
+        RegisterRequest(
+            username=username,
+            email="admin@example.com",
+            password="StrongPass123",
+        )
 
 
 @pytest.mark.asyncio

@@ -104,9 +104,15 @@ class RegisterRequest(BaseModel):
     @field_validator("username")
     @classmethod
     def username_alphanumeric(cls, v: str) -> str:
-        if not v.replace("_", "").replace("-", "").replace(".", "").isalnum():
+        components = v.split(".")
+        if any(
+            not component
+            or not component.replace("_", "").replace("-", "").isalnum()
+            for component in components
+        ):
             raise ValueError(
-                "Username must contain only letters, numbers, periods, hyphens, and underscores"
+                "Username must contain letters, numbers, hyphens, or underscores, "
+                "with single periods separating non-empty components"
             )
         return v.lower()
 
