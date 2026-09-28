@@ -29,8 +29,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from app.client_ip import client_ip_from_request
 from app.database import init_db, db_url
+from app.rate_limit import limiter
 from app.settings_manager import settings
 from app.routers import inbox, leads, campaigns, test_mode
 from app.routers import gmail_oauth
@@ -191,16 +191,8 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Rate limiting – 200 req/min per IP by default on all routes
 # ---------------------------------------------------------------------------
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-
-
-def _get_real_ip(request: Request) -> str:
-    """Rate-limit key: client IP via common proxy/CDN headers, else the socket."""
-    return client_ip_from_request(request) or "unknown"
-
-
-limiter = Limiter(key_func=_get_real_ip, default_limits=["200/minute"])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 

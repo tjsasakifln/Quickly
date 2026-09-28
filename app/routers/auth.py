@@ -1,8 +1,10 @@
 """Authentication API routes: register, login, token refresh, API key management."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from fastapi import (
@@ -18,7 +20,8 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import (
@@ -52,11 +55,41 @@ from app.client_ip import client_ip_from_request
 from app.database import AsyncSessionLocal, get_db
 from app.restore_preview_rate import allow_restore_preview
 from app.models import APIKey, User
+from app.rate_limit import (
+    AUTH_FIRST_ADMIN_LIMIT,
+    AUTH_LOGIN_LIMIT,
+    AUTH_REFRESH_LIMIT,
+    AUTH_SETUP_STATUS_LIMIT,
+    limiter,
+)
 from app.time import utcnow
 
 log = logging.getLogger("quickly.auth.routes")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+# A transaction-scoped PostgreSQL advisory lock serializes the only operation
+# that may elect an initial administrator.  SQLite is not a production target,
+# but tests and local development use it; the process-local lock is safe there
+# because registration commits before releasing it.
+_FIRST_ADMIN_ADVISORY_LOCK_ID = 0x515549434B4C5901
+_sqlite_first_admin_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _first_admin_creation_guard(db: AsyncSession):
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+            {"lock_id": _FIRST_ADMIN_ADVISORY_LOCK_ID},
+        )
+        yield
+        return
+
+    async with _sqlite_first_admin_lock:
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +194,8 @@ class UserResponse(BaseModel):
 
 
 @router.get("/setup-status")
-async def setup_status(db: AsyncSession = Depends(get_db)):
+@limiter.limit(AUTH_SETUP_STATUS_LIMIT)
+async def setup_status(request: Request, db: AsyncSession = Depends(get_db)):
     """Check if initial setup (first user registration) is complete."""
     done = await is_setup_complete(db)
     return {"setup_complete": done}
@@ -293,7 +327,12 @@ async def restore_setup_execute(
 
 
 @router.post("/register", response_model=UserResponse, status_code=201)
-async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit(AUTH_FIRST_ADMIN_LIMIT)
+async def register(
+    request: Request,
+    data: RegisterRequest,
+    db: AsyncSession = Depends(get_db),
+):
     """Register a new user. The first user automatically becomes admin.
     Subsequent registrations are closed and require an admin to create accounts.
     """
@@ -303,29 +342,59 @@ async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
             status_code=403,
             detail="Registration closed. Contact an admin to create new accounts.",
         )
+    # End the optimistic read transaction before taking the creation lock.
+    # This guarantees the second check gets a fresh snapshot even if a server
+    # is configured with stricter-than-default transaction isolation.
+    await db.rollback()
 
-    # Check for existing username/email
-    existing = await db.execute(
-        select(User).where((User.username == data.username) | (User.email == data.email))
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="Username or email already taken")
+    async with _first_admin_creation_guard(db):
+        # Another request may have created the first user while this one was
+        # waiting for the advisory/process lock.  Re-check under the lock.
+        if await is_setup_complete(db):
+            raise HTTPException(
+                status_code=403,
+                detail="Registration closed. Contact an admin to create new accounts.",
+            )
 
-    user = User(
-        username=data.username,
-        email=data.email,
-        password_hash=hash_password(data.password),
-        role="admin",  # First user is always admin
-        is_active=True,
-    )
-    db.add(user)
-    await db.flush()
+        existing = await db.execute(
+            select(User).where((User.username == data.username) | (User.email == data.email))
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Username or email already taken")
+
+        user = User(
+            username=data.username,
+            email=data.email,
+            password_hash=hash_password(data.password),
+            role="admin",  # First user is always admin
+            is_active=True,
+        )
+        db.add(user)
+        try:
+            await db.flush()
+            # Visibility and lock release must be atomic.  In PostgreSQL this
+            # ends the advisory-xact lock; in SQLite it makes the row visible
+            # before the process-local guard is released.
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Username or email already taken",
+            ) from exc
+
     log.info("First user registered: %s (admin)", user.username)
     return user
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(data: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)):
+@limiter.limit(AUTH_LOGIN_LIMIT)
+async def login(
+    request: Request,
+    data: LoginRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     """Authenticate and return JWT tokens."""
     result = await db.execute(select(User).where(User.username == data.username.lower()))
     user = result.scalar_one_or_none()
@@ -366,6 +435,7 @@ async def login(data: LoginRequest, response: Response, db: AsyncSession = Depen
 
 
 @router.post("/refresh", response_model=TokenResponse)
+@limiter.limit(AUTH_REFRESH_LIMIT)
 async def refresh_token(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     """Exchange a refresh token for a new access token."""
     token = request.cookies.get("refresh_token")
