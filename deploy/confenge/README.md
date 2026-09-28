@@ -27,7 +27,7 @@ Crie a campanha, importe `demo/contatos-demo.csv`, configure três etapas pausad
 
 `./scripts/backup.sh` cria `backups/quickly-confenge-*.tgz` (dump PostgreSQL, digest da imagem e fingerprint não reversível da chave Fernet) e o respectivo `.sha256`, ambos com permissão 0600 e retenção de 30 dias. Ele deliberadamente **não** arquiva `.env`, senhas ou chaves; copie o par para armazenamento offsite criptografado — o disco local não é a única cópia. `./scripts/restore.sh ARQUIVO` exige o sidecar de checksum, a mesma chave Fernet configurada localmente e o mesmo digest de imagem. Se houver uma revisão explícita de compatibilidade, `./scripts/restore.sh --allow-image-mismatch ARQUIVO` permite somente a divergência de imagem; a divergência da chave continua bloqueada. Em recuperação total em host novo, recupere as variáveis estáveis por canal seguro, suba o compose com o digest compatível e então execute o restore.
 
-`./scripts/update.sh` faz backup, aceita somente a imagem autorizada e conserva snapshots `*.previous`; `./scripts/rollback.sh` retorna a configuração anterior, mas não tenta downgrade de banco — para incompatibilidade, restaure backup compatível. Esta versão fixa não prevê atualização para imagem diferente sem revisão explícita de compatibilidade.
+Após revisão explícita de compatibilidade, `./scripts/update.sh ghcr.io/tjsasakifln/quickly-confenge@sha256:<digest>` baixa o alvo, faz backup da versão atualmente configurada, conserva snapshots `*.previous` e só então troca o digest. `./scripts/rollback.sh` retorna a configuração anterior, mas não tenta downgrade de banco — para incompatibilidade, restaure backup compatível.
 
 ## Verificação mínima
 
