@@ -10,6 +10,12 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - quickly_confenge_pgdata:/var/lib/postgresql/data
+    # Compose applies these limits without requiring Docker Swarm.
+    mem_limit: 1g
+    cpus: "1.00"
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
     networks: [quickly_confenge_internal]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
@@ -34,6 +40,16 @@ services:
       - "127.0.0.1:19080:8000"
     volumes:
       - ./app-backups:/app/backups
+    # Compose applies these limits without requiring Docker Swarm. The app does
+    # not need Linux capabilities; keep PostgreSQL's defaults for first-run
+    # volume initialization compatibility.
+    mem_limit: 1g
+    cpus: "1.00"
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     networks: [quickly_confenge_internal]
     depends_on:
       db:

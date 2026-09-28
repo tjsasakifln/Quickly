@@ -11,9 +11,12 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 docker compose -f compose.yml exec -T db pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc >"$work/database.dump"
-cp .env "$work/runtime.env"
 printf '%s\n' "$QUICKLY_IMAGE" >"$work/image.txt"
-tar -C "$work" -czf "backups/quickly-confenge-$stamp.tgz" database.dump runtime.env image.txt
-chmod 600 "backups/quickly-confenge-$stamp.tgz"
+printf '%s\n' "$(printf '%s' "$QUICKLY_ENCRYPTION_KEY" | sha256sum | awk '{print $1}')" >"$work/encryption-key.sha256"
+archive="backups/quickly-confenge-$stamp.tgz"
+tar -C "$work" -czf "$archive" database.dump image.txt encryption-key.sha256
+(cd "$(dirname "$archive")" && sha256sum "$(basename "$archive")" >"$(basename "$archive").sha256")
+chmod 600 "$archive" "$archive.sha256"
 find backups -type f -name 'quickly-confenge-*.tgz' -mtime +30 -delete
-echo "Created backups/quickly-confenge-$stamp.tgz"
+find backups -type f -name 'quickly-confenge-*.tgz.sha256' -mtime +30 -delete
+echo "Created $archive and $archive.sha256. Copy both to encrypted offsite storage; this local backup is not the only copy."
